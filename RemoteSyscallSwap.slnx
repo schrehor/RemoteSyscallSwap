@@ -1,0 +1,7 @@
+<Solution>
+  <Configurations>
+    <Platform Name="x64" />
+  </Configurations>
+  <Project Path="RemoteSyscallSwap.vcxproj" Id="c7884214-4583-45f6-a4be-89124751005c" />
+  <Project Path="SwapTarget\SwapTarget.vcxproj" Id="2f4e6ab6-3b38-4a49-8852-0ee89f845f60" />
+</Solution>
