@@ -28,6 +28,12 @@ typedef struct
 	BOOL controlDone;
 	BOOL hijacked;
 	DWORD64 savedRip;
+	ULONG_PTR remoteStub;
+	ULONG_PTR protectPage;
+	DWORD oldProtection;
+	BOOL protectionChanged;
+	BOOL patched;
+	BYTE originalStubBytes[5];
 } SWAP_STATE;
 
 static LPCBYTE SearchForMaskedSignature(
@@ -199,6 +205,73 @@ static void HandleLoadDll(SWAP_STATE* state, const DEBUG_EVENT* event)
 	}
 }
 
+static BOOL PatchRemoteStub(SWAP_STATE* state)
+{
+	state->remoteStub = state->childNtdllBase
+		+ (state->localStub - state->localNtdllBase);
+
+	BYTE before[8];
+	SIZE_T bytesRead = 0;
+	if (!ReadProcessMemory(state->process.hProcess, (LPCVOID)state->remoteStub,
+		before, sizeof(before), &bytesRead) || bytesRead != sizeof(before))
+	{
+		fprintf(stderr, "[-] ReadProcessMemory(stub) - E%lu\n", GetLastError());
+		return FALSE;
+	}
+	if (before[0] != 0x4C || before[1] != 0x8B || before[2] != 0xD1
+		|| before[3] != 0xB8 || *(DWORD*)(before + 4) != state->sourceNumber)
+	{
+		fprintf(stderr, "[-] Remote stub layout/number mismatch - unsupported host\n");
+		return FALSE;
+	}
+	printf("[+] Remote stub 0x%llX verified - syscall 0x%lX\n",
+		(unsigned long long)state->remoteStub, state->sourceNumber);
+
+	state->protectPage = state->remoteStub & ~(ULONG_PTR)0xFFF;
+	if (!VirtualProtectEx(state->process.hProcess, (LPVOID)state->protectPage,
+		0x1000, PAGE_EXECUTE_READWRITE, &state->oldProtection))
+	{
+		fprintf(stderr, "[-] VirtualProtectEx - E%lu\n", GetLastError());
+		return FALSE;
+	}
+	state->protectionChanged = TRUE;
+	memcpy(state->originalStubBytes, before + 3, sizeof(state->originalStubBytes));
+
+	BYTE replacement[5] = { 0xB8, 0, 0, 0, 0 };
+	*(DWORD*)(replacement + 1) = state->targetNumber;
+	SIZE_T bytesWritten = 0;
+	if (!WriteProcessMemory(state->process.hProcess, (LPVOID)(state->remoteStub + 3),
+		replacement, sizeof(replacement), &bytesWritten)
+		|| bytesWritten != sizeof(replacement))
+	{
+		fprintf(stderr, "[-] WriteProcessMemory(stub) - E%lu\n", GetLastError());
+		return FALSE;
+	}
+	state->patched = TRUE;
+
+	BYTE after[8];
+	if (!ReadProcessMemory(state->process.hProcess, (LPCVOID)state->remoteStub,
+		after, sizeof(after), &bytesRead) || bytesRead != sizeof(after)
+		|| *(DWORD*)(after + 4) != state->targetNumber)
+	{
+		fprintf(stderr, "[-] Post-write verification failed\n");
+		return FALSE;
+	}
+	printf("[+] Syscall number swapped 0x%lX -> 0x%lX and read back\n",
+		state->sourceNumber, state->targetNumber);
+
+	DWORD unused;
+	if (!VirtualProtectEx(state->process.hProcess, (LPVOID)state->protectPage,
+		0x1000, state->oldProtection, &unused))
+	{
+		fprintf(stderr, "[-] VirtualProtectEx(restore) - E%lu\n", GetLastError());
+		return FALSE;
+	}
+	state->protectionChanged = FALSE;
+	printf("[+] Page protection restored to 0x%lX\n", state->oldProtection);
+	return TRUE;
+}
+
 static BOOL ControlStage(SWAP_STATE* state, const DEBUG_EVENT* event)
 {
 	ULONG_PTR remoteLoop = state->childKernelbaseBase + state->loopRva;
@@ -243,6 +316,15 @@ static BOOL ControlStage(SWAP_STATE* state, const DEBUG_EVENT* event)
 		spin.Rip == remoteLoop ? "matches self-loop" : "UNEXPECTED");
 	BOOL spinMatched = spin.Rip == remoteLoop;
 
+	if (!PatchRemoteStub(state))
+	{
+		spin.Rip = state->savedRip;
+		SetThreadContext(state->process.hThread, &spin);
+		ResumeThread(state->process.hThread);
+		state->hijacked = FALSE;
+		return FALSE;
+	}
+
 	spin.Rip = state->savedRip;
 	if (!SetThreadContext(state->process.hThread, &spin))
 	{
@@ -251,6 +333,11 @@ static BOOL ControlStage(SWAP_STATE* state, const DEBUG_EVENT* event)
 		return FALSE;
 	}
 	state->hijacked = FALSE;
+	if (!state->autoMode)
+	{
+		printf("[+] Syscall replaced - press Enter to resume the debuggee\n");
+		(void)getchar();
+	}
 	if (ResumeThread(state->process.hThread) == (DWORD)-1)
 	{
 		fprintf(stderr, "[-] ResumeThread - E%lu\n", GetLastError());
@@ -263,6 +350,35 @@ static BOOL ControlStage(SWAP_STATE* state, const DEBUG_EVENT* event)
 
 static void Cleanup(SWAP_STATE* state, BOOL terminateChild)
 {
+	if (terminateChild)
+	{
+		if (state->patched && state->process.hProcess)
+		{
+			SIZE_T written;
+			if (WriteProcessMemory(state->process.hProcess,
+				(LPVOID)(state->remoteStub + 3),
+				state->originalStubBytes, sizeof(state->originalStubBytes), &written))
+				printf("[+] Original stub bytes restored on abort\n");
+		}
+		if (state->protectionChanged && state->process.hProcess)
+		{
+			DWORD unused;
+			if (VirtualProtectEx(state->process.hProcess, (LPVOID)state->protectPage,
+				0x1000, state->oldProtection, &unused))
+				printf("[+] Page protection restored on abort\n");
+		}
+		if (state->hijacked && state->process.hThread)
+		{
+			SuspendThread(state->process.hThread);
+			CONTEXT ctx = { .ContextFlags = CONTEXT_CONTROL };
+			if (GetThreadContext(state->process.hThread, &ctx))
+			{
+				ctx.Rip = state->savedRip;
+				SetThreadContext(state->process.hThread, &ctx);
+			}
+			ResumeThread(state->process.hThread);
+		}
+	}
 	if (terminateChild && state->process.hProcess)
 	{
 		TerminateProcess(state->process.hProcess, 1);
