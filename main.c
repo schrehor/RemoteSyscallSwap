@@ -172,13 +172,14 @@ static const char* EventName(DWORD code)
 
 static void HandleLoadDll(SWAP_STATE* state, const DEBUG_EVENT* event)
 {
-	wchar_t path[512];
+	wchar_t path[512] = { 0 };
 	DWORD length = GetFinalPathNameByHandleW(
 		event->u.LoadDll.hFile,
 		path,
 		(DWORD)(sizeof(path) / sizeof(path[0])),
 		FILE_NAME_NORMALIZED);
-	if (length && length < sizeof(path) / sizeof(path[0]))
+	BOOL named = length > 0 && length < sizeof(path) / sizeof(path[0]);
+	if (named)
 		printf("[+] LOAD_DLL pid=%lu base=0x%llX %ls\n",
 			event->dwProcessId,
 			(unsigned long long)(ULONG_PTR)event->u.LoadDll.lpBaseOfDll,
@@ -191,17 +192,20 @@ static void HandleLoadDll(SWAP_STATE* state, const DEBUG_EVENT* event)
 	if (event->u.LoadDll.hFile)
 		CloseHandle(event->u.LoadDll.hFile);
 
-	const wchar_t* name = wcsrchr(path, L'\\');
-	name = name ? name + 1 : path;
-	if (length && _wcsicmp(name, L"ntdll.dll") == 0)
+	if (named)
 	{
-		state->ntdllSeen = TRUE;
-		state->childNtdllBase = (ULONG_PTR)event->u.LoadDll.lpBaseOfDll;
-	}
-	if (length && _wcsicmp(name, L"kernelbase.dll") == 0)
-	{
-		state->kernelbaseSeen = TRUE;
-		state->childKernelbaseBase = (ULONG_PTR)event->u.LoadDll.lpBaseOfDll;
+		const wchar_t* name = wcsrchr(path, L'\\');
+		name = name ? name + 1 : path;
+		if (_wcsicmp(name, L"ntdll.dll") == 0)
+		{
+			state->ntdllSeen = TRUE;
+			state->childNtdllBase = (ULONG_PTR)event->u.LoadDll.lpBaseOfDll;
+		}
+		if (_wcsicmp(name, L"kernelbase.dll") == 0)
+		{
+			state->kernelbaseSeen = TRUE;
+			state->childKernelbaseBase = (ULONG_PTR)event->u.LoadDll.lpBaseOfDll;
+		}
 	}
 }
 
@@ -308,7 +312,6 @@ static BOOL ControlStage(SWAP_STATE* state, const DEBUG_EVENT* event)
 	if (!GetThreadContext(state->process.hThread, &spin))
 	{
 		fprintf(stderr, "[-] GetThreadContext(spin) - E%lu\n", GetLastError());
-		ResumeThread(state->process.hThread);
 		return FALSE;
 	}
 	printf("[+] Observed spin RIP 0x%llX (%s)\n",
@@ -319,8 +322,8 @@ static BOOL ControlStage(SWAP_STATE* state, const DEBUG_EVENT* event)
 	if (!PatchRemoteStub(state))
 	{
 		spin.Rip = state->savedRip;
-		SetThreadContext(state->process.hThread, &spin);
-		ResumeThread(state->process.hThread);
+		if (!SetThreadContext(state->process.hThread, &spin))
+			fprintf(stderr, "[-] SetThreadContext(abort restore) - E%lu\n", GetLastError());
 		state->hijacked = FALSE;
 		return FALSE;
 	}
@@ -329,7 +332,6 @@ static BOOL ControlStage(SWAP_STATE* state, const DEBUG_EVENT* event)
 	if (!SetThreadContext(state->process.hThread, &spin))
 	{
 		fprintf(stderr, "[-] SetThreadContext(restore) - E%lu\n", GetLastError());
-		ResumeThread(state->process.hThread);
 		return FALSE;
 	}
 	state->hijacked = FALSE;
@@ -465,6 +467,16 @@ int wmain(int argc, wchar_t* argv[])
 				printf("[+] CREATE_PROCESS pid=%lu\n", event.dwProcessId);
 				if (event.u.CreateProcessInfo.hFile)
 					CloseHandle(event.u.CreateProcessInfo.hFile);
+				if (event.u.CreateProcessInfo.hThread)
+					CloseHandle(event.u.CreateProcessInfo.hThread);
+				if (event.u.CreateProcessInfo.hProcess)
+					CloseHandle(event.u.CreateProcessInfo.hProcess);
+				break;
+			case CREATE_THREAD_DEBUG_EVENT:
+				printf("[+] CREATE_THREAD pid=%lu tid=%lu\n",
+					event.dwProcessId, event.dwThreadId);
+				if (event.u.CreateThread.hThread)
+					CloseHandle(event.u.CreateThread.hThread);
 				break;
 			case LOAD_DLL_DEBUG_EVENT:
 				HandleLoadDll(&state, &event);
