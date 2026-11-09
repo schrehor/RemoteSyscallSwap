@@ -25,6 +25,9 @@ typedef struct
 	DWORD targetNumber;
 	ULONGLONG startTick;
 	DWORD childExitCode;
+	BOOL controlDone;
+	BOOL hijacked;
+	DWORD64 savedRip;
 } SWAP_STATE;
 
 static LPCBYTE SearchForMaskedSignature(
@@ -196,6 +199,68 @@ static void HandleLoadDll(SWAP_STATE* state, const DEBUG_EVENT* event)
 	}
 }
 
+static BOOL ControlStage(SWAP_STATE* state, const DEBUG_EVENT* event)
+{
+	ULONG_PTR remoteLoop = state->childKernelbaseBase + state->loopRva;
+	CONTEXT ctx = { .ContextFlags = CONTEXT_CONTROL };
+
+	if (!GetThreadContext(state->process.hThread, &ctx))
+	{
+		fprintf(stderr, "[-] GetThreadContext - E%lu\n", GetLastError());
+		return FALSE;
+	}
+	state->savedRip = ctx.Rip;
+	ctx.Rip = remoteLoop;
+	if (!SetThreadContext(state->process.hThread, &ctx))
+	{
+		fprintf(stderr, "[-] SetThreadContext(loop) - E%lu\n", GetLastError());
+		return FALSE;
+	}
+	state->hijacked = TRUE;
+	if (!ContinueDebugEvent(event->dwProcessId, event->dwThreadId, DBG_CONTINUE))
+	{
+		fprintf(stderr, "[-] ContinueDebugEvent(hijack) - E%lu\n", GetLastError());
+		return FALSE;
+	}
+	printf("[+] Thread redirected - saved RIP 0x%llX, self-loop 0x%llX\n",
+		(unsigned long long)state->savedRip, (unsigned long long)remoteLoop);
+
+	Sleep(200);
+	if (SuspendThread(state->process.hThread) == (DWORD)-1)
+	{
+		fprintf(stderr, "[-] SuspendThread - E%lu\n", GetLastError());
+		return FALSE;
+	}
+	CONTEXT spin = { .ContextFlags = CONTEXT_CONTROL };
+	if (!GetThreadContext(state->process.hThread, &spin))
+	{
+		fprintf(stderr, "[-] GetThreadContext(spin) - E%lu\n", GetLastError());
+		ResumeThread(state->process.hThread);
+		return FALSE;
+	}
+	printf("[+] Observed spin RIP 0x%llX (%s)\n",
+		(unsigned long long)spin.Rip,
+		spin.Rip == remoteLoop ? "matches self-loop" : "UNEXPECTED");
+	BOOL spinMatched = spin.Rip == remoteLoop;
+
+	spin.Rip = state->savedRip;
+	if (!SetThreadContext(state->process.hThread, &spin))
+	{
+		fprintf(stderr, "[-] SetThreadContext(restore) - E%lu\n", GetLastError());
+		ResumeThread(state->process.hThread);
+		return FALSE;
+	}
+	state->hijacked = FALSE;
+	if (ResumeThread(state->process.hThread) == (DWORD)-1)
+	{
+		fprintf(stderr, "[-] ResumeThread - E%lu\n", GetLastError());
+		return FALSE;
+	}
+	printf("[+] Original RIP restored and thread resumed\n");
+	state->controlDone = TRUE;
+	return spinMatched;
+}
+
 static void Cleanup(SWAP_STATE* state, BOOL terminateChild)
 {
 	if (terminateChild && state->process.hProcess)
@@ -287,6 +352,16 @@ int wmain(int argc, wchar_t* argv[])
 				break;
 			case LOAD_DLL_DEBUG_EVENT:
 				HandleLoadDll(&state, &event);
+				if (state.ntdllSeen && state.kernelbaseSeen && !state.controlDone)
+				{
+					if (!ControlStage(&state, &event))
+					{
+						fprintf(stderr, "[-] Thread-control stage failed\n");
+						Cleanup(&state, TRUE);
+						return EXIT_FAILURE;
+					}
+					continue;
+				}
 				break;
 			case EXIT_PROCESS_DEBUG_EVENT:
 				state.childExitCode = event.u.ExitProcess.dwExitCode;
