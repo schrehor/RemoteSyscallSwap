@@ -43,21 +43,29 @@ static LPCBYTE SearchForMaskedSignature(
 	SIZE_T signatureCount)
 {
 	if (!searchBase || !signature || !signatureCount || signatureCount > searchSize)
+	{
 		return NULL;
+	}
 
 	LPCBYTE bytes = (LPCBYTE)searchBase;
 	SIZE_T anchor = 0;
 	while (anchor < signatureCount && signature[anchor] == UMASK_WC)
+	{
 		++anchor;
+	}
 	if (anchor == signatureCount)
+	{
 		return bytes;
+	}
 
 	SIZE_T startCount = searchSize - signatureCount + 1;
 	for (SIZE_T i = 0; i < startCount; ++i)
 	{
 		LPCBYTE window = bytes + i;
 		if (window[anchor] != (BYTE)signature[anchor])
+		{
 			continue;
+		}
 		BOOL match = TRUE;
 		for (SIZE_T j = 0; j < signatureCount; ++j)
 		{
@@ -68,7 +76,9 @@ static LPCBYTE SearchForMaskedSignature(
 			}
 		}
 		if (match)
+		{
 			return window;
+		}
 	}
 	return NULL;
 }
@@ -78,16 +88,22 @@ static BOOL FindLoopRva(HMODULE module, ULONG_PTR* rva)
 	LPCBYTE base = (LPCBYTE)module;
 	PIMAGE_DOS_HEADER dos = (PIMAGE_DOS_HEADER)base;
 	if (dos->e_magic != IMAGE_DOS_SIGNATURE || dos->e_lfanew <= 0)
+	{
 		return FALSE;
+	}
 	PIMAGE_NT_HEADERS64 nt = (PIMAGE_NT_HEADERS64)(base + dos->e_lfanew);
 	if (nt->Signature != IMAGE_NT_SIGNATURE)
+	{
 		return FALSE;
+	}
 
 	PIMAGE_SECTION_HEADER section = IMAGE_FIRST_SECTION(nt);
 	for (WORD i = 0; i < nt->FileHeader.NumberOfSections; ++i, ++section)
 	{
 		if (strcmp((const char*)section->Name, ".text") != 0)
+		{
 			continue;
+		}
 		const UMASK loopSignature[] = { 0xEB, 0xFE };
 		LPCBYTE hit = SearchForMaskedSignature(
 			base + section->VirtualAddress,
@@ -137,7 +153,9 @@ static BOOL Preflight(SWAP_STATE* state)
 
 	if (!ReadStubNumber(ntdll, "NtAccessCheckAndAuditAlarm", &state->sourceNumber)
 		|| !ReadStubNumber(ntdll, "NtWriteVirtualMemory", &state->targetNumber))
+	{
 		return FALSE;
+	}
 	state->localStub = (ULONG_PTR)GetProcAddress(ntdll, "NtAccessCheckAndAuditAlarm");
 
 	if (!FindLoopRva(kernelbase, &state->loopRva))
@@ -180,17 +198,23 @@ static void HandleLoadDll(SWAP_STATE* state, const DEBUG_EVENT* event)
 		FILE_NAME_NORMALIZED);
 	BOOL named = length > 0 && length < sizeof(path) / sizeof(path[0]);
 	if (named)
+	{
 		printf("[+] LOAD_DLL pid=%lu base=0x%llX %ls\n",
 			event->dwProcessId,
 			(unsigned long long)(ULONG_PTR)event->u.LoadDll.lpBaseOfDll,
 			path);
+	}
 	else
+	{
 		printf("[+] LOAD_DLL pid=%lu base=0x%llX (name unavailable)\n",
 			event->dwProcessId,
 			(unsigned long long)(ULONG_PTR)event->u.LoadDll.lpBaseOfDll);
+	}
 
 	if (event->u.LoadDll.hFile)
+	{
 		CloseHandle(event->u.LoadDll.hFile);
+	}
 
 	if (named)
 	{
@@ -323,7 +347,9 @@ static BOOL ControlStage(SWAP_STATE* state, const DEBUG_EVENT* event)
 	{
 		spin.Rip = state->savedRip;
 		if (!SetThreadContext(state->process.hThread, &spin))
+		{
 			fprintf(stderr, "[-] SetThreadContext(abort restore) - E%lu\n", GetLastError());
+		}
 		state->hijacked = FALSE;
 		return FALSE;
 	}
@@ -360,14 +386,18 @@ static void Cleanup(SWAP_STATE* state, BOOL terminateChild)
 			if (WriteProcessMemory(state->process.hProcess,
 				(LPVOID)(state->remoteStub + 3),
 				state->originalStubBytes, sizeof(state->originalStubBytes), &written))
+			{
 				printf("[+] Original stub bytes restored on abort\n");
+			}
 		}
 		if (state->protectionChanged && state->process.hProcess)
 		{
 			DWORD unused;
 			if (VirtualProtectEx(state->process.hProcess, (LPVOID)state->protectPage,
 				0x1000, state->oldProtection, &unused))
+			{
 				printf("[+] Page protection restored on abort\n");
+			}
 		}
 		if (state->hijacked && state->process.hThread)
 		{
@@ -387,11 +417,17 @@ static void Cleanup(SWAP_STATE* state, BOOL terminateChild)
 		WaitForSingleObject(state->process.hProcess, 5000);
 	}
 	if (state->attached)
+	{
 		DebugActiveProcessStop(state->process.dwProcessId);
+	}
 	if (state->process.hThread)
+	{
 		CloseHandle(state->process.hThread);
+	}
 	if (state->process.hProcess)
+	{
 		CloseHandle(state->process.hProcess);
+	}
 }
 
 int wmain(int argc, wchar_t* argv[])
@@ -402,9 +438,13 @@ int wmain(int argc, wchar_t* argv[])
 	for (int i = 1; i < argc; ++i)
 	{
 		if (wcscmp(argv[i], L"--auto") == 0 && !state.autoMode)
+		{
 			state.autoMode = TRUE;
+		}
 		else if (!targetPath && argv[i][0] != L'-')
+		{
 			targetPath = argv[i];
+		}
 		else
 		{
 			fprintf(stderr, "Usage: RemoteSyscallSwap.exe <exePath> [--auto]\n");
@@ -418,7 +458,9 @@ int wmain(int argc, wchar_t* argv[])
 	}
 
 	if (!Preflight(&state))
+	{
 		return EXIT_FAILURE;
+	}
 
 	STARTUPINFOW startup = { .cb = sizeof(startup) };
 	if (!CreateProcessW(
@@ -454,7 +496,9 @@ int wmain(int argc, wchar_t* argv[])
 		if (!WaitForDebugEvent(&event, EVENT_TIMEOUT_MS))
 		{
 			if (GetLastError() == WAIT_TIMEOUT)
+			{
 				continue;
+			}
 			fprintf(stderr, "[-] WaitForDebugEvent - E%lu\n", GetLastError());
 			Cleanup(&state, TRUE);
 			return EXIT_FAILURE;
@@ -466,17 +510,25 @@ int wmain(int argc, wchar_t* argv[])
 			case CREATE_PROCESS_DEBUG_EVENT:
 				printf("[+] CREATE_PROCESS pid=%lu\n", event.dwProcessId);
 				if (event.u.CreateProcessInfo.hFile)
+				{
 					CloseHandle(event.u.CreateProcessInfo.hFile);
+				}
 				if (event.u.CreateProcessInfo.hThread)
+				{
 					CloseHandle(event.u.CreateProcessInfo.hThread);
+				}
 				if (event.u.CreateProcessInfo.hProcess)
+				{
 					CloseHandle(event.u.CreateProcessInfo.hProcess);
+				}
 				break;
 			case CREATE_THREAD_DEBUG_EVENT:
 				printf("[+] CREATE_THREAD pid=%lu tid=%lu\n",
 					event.dwProcessId, event.dwThreadId);
 				if (event.u.CreateThread.hThread)
+				{
 					CloseHandle(event.u.CreateThread.hThread);
+				}
 				break;
 			case LOAD_DLL_DEBUG_EVENT:
 				HandleLoadDll(&state, &event);
@@ -503,7 +555,9 @@ int wmain(int argc, wchar_t* argv[])
 					event.u.Exception.ExceptionRecord.ExceptionCode,
 					event.u.Exception.dwFirstChance);
 				if (event.u.Exception.ExceptionRecord.ExceptionCode != EXCEPTION_BREAKPOINT)
+				{
 					continueStatus = DBG_EXCEPTION_NOT_HANDLED;
+				}
 				break;
 			default:
 				printf("[+] %s pid=%lu tid=%lu\n",
