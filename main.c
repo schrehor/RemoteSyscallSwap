@@ -523,5 +523,10 @@ int wmain(int argc, wchar_t* argv[])
 
 	Cleanup(&state, FALSE);
 	printf("[+] Debuggee lifecycle complete - child exit code %lu\n", state.childExitCode);
+	if (state.childExitCode != 0)
+	{
+		fprintf(stderr, "[-] Debuggee exited with code %lu; reporting failure\n", state.childExitCode);
+		return EXIT_FAILURE;
+	}
 	return EXIT_SUCCESS;
 }
